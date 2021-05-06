@@ -2,7 +2,6 @@ import os
 import sys
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -15,15 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from losses.nnclr import nnclr_loss_func
 from utils.metrics import accuracy_at_k
-
-
-@torch.no_grad()
-def concat_all_gather(tensor):
-    tensors_gather = [torch.ones_like(tensor) for _ in range(dist.get_world_size())]
-    dist.all_gather(tensors_gather, tensor, async_op=False)
-
-    output = torch.cat(tensors_gather, dim=0)
-    return output
+from utils.gather_layer import gather
 
 
 class NNCLR(Model):
@@ -64,8 +55,8 @@ class NNCLR(Model):
 
     @torch.no_grad()
     def dequeue_and_enqueue(self, z, y):
-        z = concat_all_gather(z)
-        y = concat_all_gather(y)
+        z = gather(z)
+        y = gather(y)
 
         batch_size = z.shape[0]
 
