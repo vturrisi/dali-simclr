@@ -94,6 +94,13 @@ class NNCLR(Model):
         idx1, nn1 = self.find_nn(z1)
         idx2, nn2 = self.find_nn(z2)
 
+        # compute nn accuracy
+        b = target.size(0)
+        nn_acc = (target == self.queue_y[idx1]).sum() / b
+
+        # dequeue and enqueue
+        self.dequeue_and_enqueue(z1, target)
+
         # ------- contrastive loss -------
         nnclr_loss = nnclr_loss_func(nn1, p2) / 2 + nnclr_loss_func(nn2, p1) / 2
 
@@ -107,13 +114,6 @@ class NNCLR(Model):
         # just add together the losses to do only one backward()
         # we have stop gradients on the output y of the model
         loss = nnclr_loss + class_loss
-
-        # compute nn accuracy
-        b = target.size(0)
-        nn_acc = (target == self.queue_y[idx1]).sum() / b
-
-        # queue
-        self.dequeue_and_enqueue(z1, target)
 
         # ------- metrics -------
         acc1, acc5 = accuracy_at_k(output, target, top_k=(1, 5))
