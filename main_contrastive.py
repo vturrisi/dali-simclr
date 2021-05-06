@@ -6,10 +6,12 @@ from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.plugins import DDPPlugin
 
 from models.barlow_twins import BarlowTwins
-from models.dali import DaliBarlowTwins, DaliSimCLR, DaliSimSiam, DaliBYOL
+from models.dali import DaliBarlowTwins, DaliSimCLR, DaliSimSiam, DaliBYOL, DaliNNCLR
 from models.simclr import SimCLR
 from models.simsiam import SimSiam
 from models.byol import BYOL
+from models.nnclr import NNCLR
+
 from utils.classification_dataloader import prepare_data as prepare_data_classification
 from utils.contrastive_dataloader import (
     prepare_dataloaders,
@@ -48,7 +50,7 @@ def parse_args():
     parser.add_argument("encoder", choices=SUPPORTED_NETWORKS, type=str)
 
     parser.add_argument(
-        "--method", choices=["simclr", "barlow_twins", "simsiam", "byol"], default=None
+        "--method", choices=["simclr", "barlow_twins", "simsiam", "byol", "nnclr"], default=None
     )
 
     # optimizer
@@ -113,6 +115,9 @@ def parse_args():
     # extra byol settings
     parser.add_argument("--base_tau_momentum", default=0.99, type=float)
     parser.add_argument("--final_tau_momentum", default=1.0, type=float)
+
+    # extra nnclr settings
+    parser.add_argument("--queue_size", type=int, default=98304)
 
     # multi-head stuff
     parser.add_argument("--n_heads", type=int, default=2)
@@ -210,6 +215,11 @@ def main():
             model = DaliBYOL(args)
         else:
             model = BYOL(args)
+    elif args.method == "nnclr":
+        if args.dali:
+            model = DaliNNCLR(args)
+        else:
+            model = NNCLR(args)
 
     # contrastive dataloader
     if not args.dali:

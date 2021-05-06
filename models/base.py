@@ -45,7 +45,8 @@ class BaseModel(pl.LightningModule):
             if args.no_lr_scheduler_for_pred_head:
                 predictor_parameters = self.predictor.parameters()
                 other_parameters = (
-                    p for name, p in self.named_parameters()
+                    p
+                    for name, p in self.named_parameters()
                     if not any(s in name for s in ["classifier", "predictor", "momentum"])
                 )
                 parameters = [
@@ -55,7 +56,8 @@ class BaseModel(pl.LightningModule):
                 ]
             else:
                 other_parameters = (
-                    p for name, p in self.named_parameters() 
+                    p
+                    for name, p in self.named_parameters()
                     if not any(s in name for s in ["classifier", "momentum"])
                 )
                 parameters = [
@@ -66,7 +68,8 @@ class BaseModel(pl.LightningModule):
             if args.no_lr_scheduler_for_pred_head:
                 predictor_parameters = self.predictor.parameters()
                 other_parameters = (
-                    p for name, p in self.named_parameters()
+                    p
+                    for name, p in self.named_parameters()
                     if not any(s in name for s in ["predictor", "momentum"])
                 )
                 parameters = [
@@ -75,17 +78,17 @@ class BaseModel(pl.LightningModule):
                 ]
             else:
                 parameters = [
-                    {"params":
-                        (p for name, p in self.named_parameters()
-                         if not any(s in name for s in ["momentum"]))
+                    {
+                        "params": (
+                            p
+                            for name, p in self.named_parameters()
+                            if not any(s in name for s in ["momentum"])
+                        )
                     },
                 ]
 
         optimizer = optimizer(
-            parameters,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            **args.extra_optimizer_args,
+            parameters, lr=args.lr, weight_decay=args.weight_decay, **args.extra_optimizer_args,
         )
         if args.lars:
             optimizer = LARSWrapper(optimizer)
@@ -97,10 +100,7 @@ class BaseModel(pl.LightningModule):
 
             if args.scheduler == "warmup_cosine":
                 scheduler = LinearWarmupCosineAnnealingLR(
-                    optimizer,
-                    warmup_epochs=10,
-                    max_epochs=args.epochs,
-                    warmup_start_lr=0.003,
+                    optimizer, warmup_epochs=10, max_epochs=args.epochs, warmup_start_lr=0.003,
                 )
             elif args.scheduler == "cosine":
                 scheduler = CosineAnnealingLR(optimizer, args.epochs)
