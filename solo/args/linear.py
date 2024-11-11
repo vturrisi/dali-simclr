@@ -1,4 +1,5 @@
 import os
+from multiprocessing.managers import BaseManager
 
 import omegaconf
 from omegaconf import OmegaConf
@@ -21,6 +22,12 @@ _N_CLASSES_PER_DATASET = {
     "stl10": 10,
     "imagenet": 1000,
     "imagenet100": 100,
+    "imagenet75": 75,
+    "imagenet50": 50,
+    "imagenet25": 25,
+    "imagenette": 10,
+    "imagewoof": 10,
+    "tiny-imagenet": 200,
 }
 
 
@@ -30,6 +37,12 @@ _SUPPORTED_DATASETS = [
     "stl10",
     "imagenet",
     "imagenet100",
+    "imagenet75",
+    "imagenet50",
+    "imagenet25",
+    "imagenette",
+    "imagewoof",
+    "tiny-imagenet",
     "custom",
 ]
 
@@ -157,11 +170,11 @@ def parse_cfg(cfg: omegaconf.DictConfig):
         # even if the custom dataset doesn't have any labels
         cfg.data.num_classes = max(
             1,
-            sum(entry.is_dir() for entry in os.scandir(cfg.data.train_path)),
+            len([entry.name for entry in os.scandir(cfg.data.train_path) if entry.is_dir]),
         )
 
     if cfg.data.format == "dali":
-        assert cfg.data.dataset in ["imagenet100", "imagenet", "custom"]
+        assert cfg.data.dataset in ["imagenet100", "imagenet", "imagenet75", "imagenet50", "imagenet25", "custom"]
 
     # adjust lr according to batch size
     cfg.num_nodes = omegaconf_select(cfg, "num_nodes", 1)

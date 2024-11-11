@@ -37,8 +37,10 @@ from solo.methods.swav import SwAV
 from solo.methods.vibcreg import VIbCReg
 from solo.methods.vicreg import VICReg
 from solo.methods.wmse import WMSE
-from solo.methods.all4one import All4One
-
+from solo.methods.mae_regularized import MAE_REG
+from solo.methods.simclr_regularized import SimCLR_REG
+from solo.methods.vicreg_regularized import VICReg_REG
+from solo.methods.u_mae import U_MAE
 
 METHODS = {
     # base classes
@@ -63,7 +65,10 @@ METHODS = {
     "vibcreg": VIbCReg,
     "vicreg": VICReg,
     "wmse": WMSE,
-    "all4one": All4One,
+    "mae-reg": MAE_REG,
+    "u-mae": U_MAE,
+    "simclr-reg": SimCLR_REG,
+    "vicreg-reg": VICReg_REG,
 }
 __all__ = [
     "BarlowTwins",
@@ -86,5 +91,7 @@ __all__ = [
     "VIbCReg",
     "VICReg",
     "WMSE",
-    "All4One",
+    "MAE_REG",
+    "SimCLR_REG",
+    "VICReg_REG",
 ]

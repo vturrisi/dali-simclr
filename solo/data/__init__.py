@@ -23,6 +23,7 @@ from solo.data import classification_dataloader, pretrain_dataloader
 __all__ = [
     "classification_dataloader",
     "pretrain_dataloader",
+    "ram_dataset",
 ]
 
 

@@ -1,0 +1,71 @@
+defaults:
+  - _self_
+  - augmentations: reconstruction.yaml
+  - wandb: private.yaml
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+# disable hydra outputs
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+name: "MUMAE"
+method: "mae-reg"
+backbone:
+  name: "vit_base"
+method_kwargs:
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  mask_ratio: 0.75
+  norm_pix_loss: True
+  layers: [10]
+  reset_classifier: True
+  uniformity_weight: 0.01
+  reg_scheduler:
+    name: "warmup"
+    base_weight: 0
+    warmup_epochs: 3
+    weight: 1
+    reg_epochs: 100
+data:
+  dataset: imagenet
+  train_path: "/path/to/imagenet/train"
+  val_path: "/path/to/imagenet/val"
+  format: "dali"
+  num_workers: 4
+optimizer:
+  name: "adamw"
+  batch_size: 256
+  lr: 1.5e-4
+  classifier_lr: 2.0e-4
+  weight_decay: 0.05
+  kwargs:
+    betas: [0.9, 0.95]
+scheduler:
+  name: "warmup_cosine"
+  warmup_start_lr: 0.0
+checkpoint:
+  enabled: True
+  dir: "output"
+  frequency: 1
+#auto_resume:
+#  enabled: True
+
+# knn_eval:
+#   enabled: True
+
+#auto_umap:
+#  enabled: True
+#  frequency: 10
+
+# overwrite PL stuff
+max_epochs: 400
+devices: [0]
+sync_batchnorm: True
+accelerator: "gpu"
+strategy: "ddp"
+precision: 16
+check_val_every_n_epoch: 10

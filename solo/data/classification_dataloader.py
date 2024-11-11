@@ -28,6 +28,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.datasets import STL10, ImageFolder
+from solo.data.ram_dataset import RAMImageFolder
 
 try:
     from solo.data.h5_dataset import H5Dataset
@@ -128,6 +129,23 @@ def prepare_transforms(dataset: str) -> Tuple[nn.Module, nn.Module]:
         ),
     }
 
+    tiny_imagenet_pipeline = {
+        "T_train": transforms.Compose(
+            [
+                transforms.RandomResizedCrop(size=64, scale=(0.08, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.480, 0.448, 0.398), std=(0.277, 0.269, 0.282)),
+            ]
+        ),
+        "T_val": transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.480, 0.448, 0.398), std=(0.277, 0.269, 0.282)),
+            ]
+        ),
+    }
+
     custom_pipeline = build_custom_pipeline()
 
     pipelines = {
@@ -136,6 +154,8 @@ def prepare_transforms(dataset: str) -> Tuple[nn.Module, nn.Module]:
         "stl10": stl_pipeline,
         "imagenet100": imagenet_pipeline,
         "imagenet": imagenet_pipeline,
+        "imagenette": imagenet_pipeline,
+        "tiny-imagenet": tiny_imagenet_pipeline,
         "custom": custom_pipeline,
     }
 
@@ -157,6 +177,7 @@ def prepare_datasets(
     data_format: Optional[str] = "image_folder",
     download: bool = True,
     data_fraction: float = -1.0,
+    skip_train_ram = False,
 ) -> Tuple[Dataset, Dataset]:
     """Prepares train and val datasets.
 
@@ -169,7 +190,7 @@ def prepare_datasets(
         val_data_path (Optional[Union[str, Path]], optional): path where the
             validation data is located. Defaults to None.
         data_format (Optional[str]): format of the data. Defaults to "image_folder".
-            Possible values are "image_folder" and "h5".
+            Possible values are "image_folder", "h5" and "ram_image_folder.
         data_fraction (Optional[float]): percentage of data to use. Use all data when set to -1.0.
             Defaults to -1.0.
 
@@ -185,7 +206,7 @@ def prepare_datasets(
         sandbox_folder = Path(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         val_data_path = sandbox_folder / "datasets"
 
-    assert dataset in ["cifar10", "cifar100", "stl10", "imagenet", "imagenet100", "custom"]
+    assert dataset in ["cifar10", "cifar100", "stl10", "imagenet", "imagenet100", "imagenette", "tiny-imagenet", "custom"]
 
     if dataset in ["cifar10", "cifar100"]:
         DatasetClass = vars(torchvision.datasets)[dataset.upper()]
@@ -217,11 +238,17 @@ def prepare_datasets(
             transform=T_val,
         )
 
-    elif dataset in ["imagenet", "imagenet100", "custom"]:
+    elif dataset in ["imagenet", "imagenet100", "imagenette", "tiny-imagenet", "custom"]:
         if data_format == "h5":
             assert _h5_available
             train_dataset = H5Dataset(dataset, train_data_path, T_train)
             val_dataset = H5Dataset(dataset, val_data_path, T_val)
+        elif data_format == "ram_image_folder":
+            if not skip_train_ram:
+                train_dataset = RAMImageFolder(train_data_path, T_train)
+            else:
+                train_dataset = ImageFolder(train_data_path, T_train)
+            val_dataset = RAMImageFolder(val_data_path, T_val)
         else:
             train_dataset = ImageFolder(train_data_path, T_train)
             val_dataset = ImageFolder(val_data_path, T_val)
@@ -284,6 +311,7 @@ def prepare_data(
     download: bool = True,
     data_fraction: float = -1.0,
     auto_augment: bool = False,
+    skip_train_ram: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """Prepares transformations, creates dataset objects and wraps them in dataloaders.
 
@@ -294,7 +322,7 @@ def prepare_data(
         val_data_path (Optional[Union[str, Path]], optional): path where the
             validation data is located. Defaults to None.
         data_format (Optional[str]): format of the data. Defaults to "image_folder".
-            Possible values are "image_folder" and "h5".
+            Possible values are "image_folder", "h5", and "ram_image_folder".
         batch_size (int, optional): batch size. Defaults to 64.
         num_workers (int, optional): number of parallel workers. Defaults to 4.
         data_fraction (Optional[float]): percentage of data to use. Use all data when set to -1.0.
@@ -330,6 +358,7 @@ def prepare_data(
         data_format=data_format,
         download=download,
         data_fraction=data_fraction,
+        skip_train_ram = skip_train_ram,
     )
     train_loader, val_loader = prepare_dataloaders(
         train_dataset,

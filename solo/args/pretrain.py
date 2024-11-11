@@ -3,6 +3,7 @@ import os
 import omegaconf
 from omegaconf import OmegaConf
 from solo.utils.auto_resumer import AutoResumer
+from solo.utils.auto_umap import AutoUMAP
 from solo.utils.checkpointer import Checkpointer
 from solo.utils.misc import omegaconf_select
 
@@ -13,19 +14,18 @@ except ImportError:
 else:
     _dali_available = True
 
-try:
-    from solo.utils.auto_umap import AutoUMAP
-except ImportError:
-    _umap_available = False
-else:
-    _umap_available = True
-
 _N_CLASSES_PER_DATASET = {
     "cifar10": 10,
     "cifar100": 100,
     "stl10": 10,
     "imagenet": 1000,
     "imagenet100": 100,
+    "imagenet75": 75,
+    "imagenet50": 50,
+    "imagenet25": 25,
+    "imagenette": 10,
+    "imagewoof": 10,
+    "tiny-imagenet": 200,
 }
 
 _SUPPORTED_DATASETS = [
@@ -34,6 +34,12 @@ _SUPPORTED_DATASETS = [
     "stl10",
     "imagenet",
     "imagenet100",
+    "imagenet75",
+    "imagenet50",
+    "imagenet25",
+    "imagenette",
+    "imagewoof",
+    "tiny-imagenet",
     "custom",
 ]
 
@@ -59,6 +65,7 @@ def add_and_assert_dataset_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfi
     cfg.data.no_labels = omegaconf_select(cfg, "data.no_labels", False)
     cfg.data.fraction = omegaconf_select(cfg, "data.fraction", -1)
     cfg.debug_augmentations = omegaconf_select(cfg, "debug_augmentations", False)
+    cfg.data.tfrecord = omegaconf_select(cfg, "data.tfrecord", False)
 
     return cfg
 
@@ -106,13 +113,12 @@ def parse_cfg(cfg: omegaconf.DictConfig):
     # default values for auto_resume
     cfg = AutoResumer.add_and_assert_specific_cfg(cfg)
 
+    # default values for auto_umap
+    cfg = AutoUMAP.add_and_assert_specific_cfg(cfg)
+
     # default values for dali
     if _dali_available:
         cfg = PretrainDALIDataModule.add_and_assert_specific_cfg(cfg)
-
-    # default values for auto_umap
-    if _umap_available:
-        cfg = AutoUMAP.add_and_assert_specific_cfg(cfg)
 
     # assert dataset parameters
     cfg = add_and_assert_dataset_cfg(cfg)
@@ -131,7 +137,7 @@ def parse_cfg(cfg: omegaconf.DictConfig):
         # even if the custom dataset doesn't have any labels
         cfg.data.num_classes = max(
             1,
-            sum(entry.is_dir() for entry in os.scandir(cfg.data.train_path)),
+            len([entry.name for entry in os.scandir(cfg.data.train_path) if entry.is_dir]),
         )
 
     # find number of big/small crops
@@ -146,7 +152,7 @@ def parse_cfg(cfg: omegaconf.DictConfig):
     cfg.data.num_small_crops = num_small_crops
 
     if cfg.data.format == "dali":
-        assert cfg.data.dataset in ["imagenet100", "imagenet", "custom"]
+        assert cfg.data.dataset in ["imagenet100", "imagenet", "imagenette", "imagenet75", "imagenet50", "imagenet25", "custom"]
 
     # adjust lr according to batch size
     cfg.num_nodes = omegaconf_select(cfg, "num_nodes", 1)
