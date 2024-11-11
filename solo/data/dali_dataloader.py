@@ -17,23 +17,41 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import math
 import os
 from pathlib import Path
 from typing import Callable, List, Optional, Union
+from subprocess import call
 
-import lightning.pytorch as pl
 import nvidia.dali.fn as fn
 import nvidia.dali.ops as ops
 import nvidia.dali.types as types
+import nvidia.dali.tfrecord as tfrec
 import omegaconf
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from nvidia.dali import pipeline_def
+from nvidia.dali.pipeline import pipeline_def
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
+from solo.utils.misc import omegaconf_select
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
-from solo.data.temp_dali_fix import TempDALIGenericIterator
-from solo.utils.misc import omegaconf_select
+
+class Mux:
+    def __init__(self, prob: float):
+        """Implements mutex operation for dali in order to support probabilitic augmentations.
+
+        Args:
+            prob (float): probability value
+        """
+
+        self.to_bool = ops.Cast(dtype=types.DALIDataType.BOOL)
+        self.rng = ops.random.CoinFlip(probability=prob)
+
+    def __call__(self, true_case, false_case):
+        condition = self.to_bool(self.rng())
+        neg_condition = condition ^ True
+        return condition * true_case + neg_condition * false_case
 
 
 class RandomGrayScaleConversion:
@@ -46,19 +64,15 @@ class RandomGrayScaleConversion:
                 Defaults to "gpu".
         """
 
-        self.prob = prob
+        self.mux = Mux(prob=prob)
         self.grayscale = ops.ColorSpaceConversion(
             device=device, image_type=types.RGB, output_type=types.GRAY
         )
 
     def __call__(self, images):
-        do_op = fn.random.coin_flip(probability=self.prob, dtype=types.DALIDataType.BOOL)
-        if do_op:
-            out = self.grayscale(images)
-            out = fn.cat(out, out, out, axis=2)
-        else:
-            out = images
-        return out
+        out = self.grayscale(images)
+        out = fn.cat(out, out, out, axis=2)
+        return self.mux(true_case=out, false_case=images)
 
 
 class RandomColorJitter:
@@ -88,7 +102,7 @@ class RandomColorJitter:
 
         assert 0 <= hue <= 0.5
 
-        self.prob = prob
+        self.mux = Mux(prob=prob)
 
         self.color = ops.ColorTwist(device=device)
 
@@ -116,18 +130,14 @@ class RandomColorJitter:
             self.hue = ops.random.Uniform(range=[-hue, hue])
 
     def __call__(self, images):
-        do_op = fn.random.coin_flip(probability=self.prob, dtype=types.DALIDataType.BOOL)
-        if do_op:
-            out = self.color(
-                images,
-                brightness=self.brightness() if callable(self.brightness) else self.brightness,
-                contrast=self.contrast() if callable(self.contrast) else self.contrast,
-                saturation=self.saturation() if callable(self.saturation) else self.saturation,
-                hue=self.hue() if callable(self.hue) else self.hue,
-            )
-        else:
-            out = images
-        return out
+        out = self.color(
+            images,
+            brightness=self.brightness() if callable(self.brightness) else self.brightness,
+            contrast=self.contrast() if callable(self.contrast) else self.contrast,
+            saturation=self.saturation() if callable(self.saturation) else self.saturation,
+            hue=self.hue() if callable(self.hue) else self.hue,
+        )
+        return self.mux(true_case=out, false_case=images)
 
 
 class RandomGaussianBlur:
@@ -141,19 +151,15 @@ class RandomGaussianBlur:
                 Defaults to "gpu".
         """
 
-        self.prob = prob
+        self.mux = Mux(prob=prob)
         # gaussian blur
         self.gaussian_blur = ops.GaussianBlur(device=device, window_size=(window_size, window_size))
         self.sigma = ops.random.Uniform(range=[0, 1])
 
     def __call__(self, images):
-        do_op = fn.random.coin_flip(probability=self.prob, dtype=types.DALIDataType.BOOL)
-        if do_op:
-            sigma = self.sigma() * 1.9 + 0.1
-            out = self.gaussian_blur(images, sigma=sigma)
-        else:
-            out = images
-        return out
+        sigma = self.sigma() * 1.9 + 0.1
+        out = self.gaussian_blur(images, sigma=sigma)
+        return self.mux(true_case=out, false_case=images)
 
 
 class RandomSolarize:
@@ -165,18 +171,15 @@ class RandomSolarize:
             prob (float, optional): probability of solarization. Defaults to 0.0.
         """
 
-        self.prob = prob
+        self.mux = Mux(prob=prob)
+
         self.threshold = threshold
 
     def __call__(self, images):
-        do_op = fn.random.coin_flip(probability=self.prob, dtype=types.DALIDataType.BOOL)
-        if do_op:
-            inverted_img = types.Constant(255, dtype=types.UINT8) - images
-            mask = images >= self.threshold
-            out = mask * inverted_img + (True ^ mask) * images
-        else:
-            out = images
-        return out
+        inverted_img = 255 - images
+        mask = images >= self.threshold
+        out = mask * inverted_img + (True ^ mask) * images
+        return self.mux(true_case=out, false_case=images)
 
 
 class NormalPipelineBuilder:
@@ -192,6 +195,7 @@ class NormalPipelineBuilder:
         num_threads: int = 4,
         seed: int = 12,
         data_fraction: float = -1.0,
+        use_tfrecords: bool = False
     ):
         """Initializes the pipeline for validation or linear eval training.
 
@@ -225,6 +229,8 @@ class NormalPipelineBuilder:
         self.device = device
         self.validation = validation
 
+        self.use_tfrecords = use_tfrecords
+
         # manually load files and labels
         labels = sorted(Path(entry.name) for entry in os.scandir(data_path) if entry.is_dir())
         data = [
@@ -243,14 +249,52 @@ class NormalPipelineBuilder:
             files, _, labels, _ = train_test_split(
                 files, labels, train_size=data_fraction, stratify=labels, random_state=42
             )
+        if self.use_tfrecords:
+            print("Using TFRecord reader")
 
-        self.reader = ops.readers.File(
-            files=files,
-            labels=labels,
-            shard_id=shard_id,
-            num_shards=num_shards,
-            shuffle_after_epoch=not self.validation,
-        )
+            tf_files = sorted(os.listdir(os.path.join(data_path, "data")))
+
+            # Create dir for idx files if not exists.
+            idx_files_dir = os.path.join(data_path, "idx_files")
+            if not os.path.exists(idx_files_dir):
+                os.mkdir(idx_files_dir)
+
+            tfrec_path_list = []
+            idx_path_list = []
+            n_samples = 0
+            # Create idx files and create TFRecordPipelines.
+            for tf_file in tf_files:
+                # Path of tf_file and idx file.
+                tfrec_path = os.path.join(data_path, "data", tf_file)
+                tfrec_path_list.append(tfrec_path)
+                idx_path = os.path.join(idx_files_dir, tf_file + "_idx")
+                idx_path_list.append(idx_path)
+                # Create idx file for tf_file by calling tfrecord2idx script.
+                if not os.path.isfile(idx_path):
+                    call(["tfrecord2idx", tfrec_path, idx_path])
+                with open(idx_path, "r") as f:
+                    n_samples += len(f.readlines())
+
+            self.reader = fn.readers.tfrecord(
+                path=tfrec_path_list,
+                index_path=idx_path_list,
+                features={
+                    "image/encoded": tfrec.FixedLenFeature((), tfrec.string, ""),  # type: ignore
+                    "image/class/label": tfrec.FixedLenFeature([1], tfrec.int64, -1),  # type: ignore
+                },
+                num_shards=num_shards,
+                shard_id=shard_id,
+                name="Reader",
+            )
+        else:
+            self.reader = ops.readers.File(
+                files=files,
+                labels=labels,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                shuffle_after_epoch=not self.validation,
+            )
+
         decoder_device = "mixed" if self.device == "gpu" else "cpu"
         device_memory_padding = 211025920 if decoder_device == "mixed" else 0
         host_memory_padding = 140544512 if decoder_device == "mixed" else 0
@@ -364,6 +408,9 @@ def build_transform_pipeline_dali(dataset, cfg, dali_device):
         "cifar100": ((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)),
         "stl10": ((0.4914, 0.4823, 0.4466), (0.247, 0.243, 0.261)),
         "imagenet100": (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+        "imagenet75": (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+        "imagenet50": (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+        "imagenet25": (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
         "imagenet": (IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
     }
 
@@ -438,7 +485,6 @@ def build_transform_pipeline_dali(dataset, cfg, dali_device):
         def __call__(self, images):
             for aug in self.augmentations:
                 images = aug(images)
-
             if self.coin:
                 images = self.cmn(images, mirror=self.coin())
             else:
@@ -467,6 +513,7 @@ class PretrainPipelineBuilder:
         no_labels: bool = False,
         encode_indexes_into_labels: bool = False,
         data_fraction: float = -1.0,
+        use_tfrecords: bool = False
     ):
         """Builder for a pretrain pipeline with Nvidia DALI.
 
@@ -498,6 +545,7 @@ class PretrainPipelineBuilder:
         self.num_threads = num_threads
         self.device_id = device_id
         self.seed = seed + device_id
+        self.use_tfrecords = use_tfrecords
 
         self.device = device
 
@@ -518,7 +566,7 @@ class PretrainPipelineBuilder:
 
         if data_fraction > 0:
             assert data_fraction < 1, "Only use data_fraction for values smaller than 1."
-
+            print(f"Using a fraction of {data_fraction} for the train_size.")
             if no_labels:
                 labels = [-1] * len(files)
             else:
@@ -552,13 +600,53 @@ class PretrainPipelineBuilder:
             # use the encoded labels which will be decoded later
             labels = encoded_labels
 
-        self.reader = ops.readers.File(
-            files=files,
-            labels=labels,
-            shard_id=shard_id,
-            num_shards=num_shards,
-            shuffle_after_epoch=random_shuffle,
-        )
+        if self.use_tfrecords:
+            print("Using TFRecord reader")
+
+            tf_files = sorted(os.listdir(os.path.join(data_path, "data")))
+
+            # Create dir for idx files if not exists.
+            idx_files_dir = os.path.join(data_path, "idx_files")
+            if not os.path.exists(idx_files_dir):
+                os.mkdir(idx_files_dir)
+
+            tfrec_path_list = []
+            idx_path_list = []
+            n_samples = 0
+            # Create idx files and create TFRecordPipelines.
+            for tf_file in tf_files:
+                # Path of tf_file and idx file.
+                tfrec_path = os.path.join(data_path, "data", tf_file)
+                tfrec_path_list.append(tfrec_path)
+                idx_path = os.path.join(idx_files_dir, tf_file + "_idx")
+                idx_path_list.append(idx_path)
+                # Create idx file for tf_file by calling tfrecord2idx script.
+                if not os.path.isfile(idx_path):
+                    call(["tfrecord2idx", tfrec_path, idx_path])
+                with open(idx_path, "r") as f:
+                    n_samples += len(f.readlines())
+
+
+            self.reader = fn.readers.tfrecord(
+                path=tfrec_path_list,
+                index_path=idx_path_list,
+                features={
+                    "image/encoded": tfrec.FixedLenFeature((), tfrec.string, ""),  # type: ignore
+                    "image/class/label": tfrec.FixedLenFeature([1], tfrec.int64, -1),  # type: ignore
+                },
+                num_shards=num_shards,
+                shard_id=shard_id,
+                name="Reader",
+                random_shuffle=True,
+            )
+        else:
+            self.reader = ops.readers.File(
+                files=files,
+                labels=labels,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                shuffle_after_epoch=random_shuffle,
+            )   
 
         decoder_device = "mixed" if self.device == "gpu" else "cpu"
         device_memory_padding = 211025920 if decoder_device == "mixed" else 0
@@ -573,12 +661,16 @@ class PretrainPipelineBuilder:
 
         self.transforms = transforms
 
-    @pipeline_def(enable_conditionals=True)
+    @pipeline_def
     def pipeline(self):
         """Defines the computational pipeline for dali operations."""
 
         # read images from memory
-        inputs, labels = self.reader(name="Reader")
+        if self.use_tfrecords:
+            inputs = self.reader['image/encoded']
+            labels = self.reader["image/class/label"] - 1
+        else:
+            inputs, labels = self.reader(name="Reader")
 
         images = self.decode(inputs)
 
@@ -595,7 +687,28 @@ class PretrainPipelineBuilder:
         return str(self.transforms)
 
 
-class PretrainWrapper(TempDALIGenericIterator):
+class BaseWrapper(DALIGenericIterator):
+    """Temporary fix to handle LastBatchPolicy.DROP."""
+
+    def __len__(self):
+        size = (
+            self._size_no_pad // self._shards_num
+            if self._last_batch_policy == LastBatchPolicy.DROP
+            else self.size
+        )
+        if self._reader_name:
+            if self._last_batch_policy != LastBatchPolicy.DROP:
+                return math.ceil(size / self.batch_size)
+
+            return size // self.batch_size
+        else:
+            if self._last_batch_policy != LastBatchPolicy.DROP:
+                return math.ceil(size / (self._devices * self.batch_size))
+
+            return size // (self._devices * self.batch_size)
+
+
+class PretrainWrapper(BaseWrapper):
     def __init__(
         self,
         model_batch_size: int,
@@ -637,28 +750,28 @@ class PretrainWrapper(TempDALIGenericIterator):
         # and as DALI owns the tensors it returns the content of it is trashed so the copy needs,
         # to be made before returning.
 
-        # I think we don't need the .detach().clone() anymore,
-        # but I'll keep it commented just to be sure.
         if self.conversion_map is not None:
-            *all_X, indexes = (batch[v] for v in self.output_map)
-            targets = self.conversion_map(indexes).flatten().long()  # .detach().clone()
-            indexes = indexes.flatten().long()  # .detach().clone()
+            *all_X, indexes = [batch[v] for v in self.output_map]
+            targets = self.conversion_map(indexes).flatten().long().detach().clone()
+            indexes = indexes.flatten().long().detach().clone()
         else:
-            *all_X, targets = (batch[v] for v in self.output_map)
-            targets = targets.squeeze(-1).long()  # .detach().clone()
+            *all_X, targets = [batch[v] for v in self.output_map]
+            targets = targets.squeeze(-1).long().detach().clone()
             # creates dummy indexes
             indexes = (
-                torch.arange(self.model_batch_size, device=self.model_device)
-                + (self.model_rank * self.model_batch_size)
-                # .detach()
-                # .clone()
+                (
+                    torch.arange(self.model_batch_size, device=self.model_device)
+                    + (self.model_rank * self.model_batch_size)
+                )
+                .detach()
+                .clone()
             )
-        # .detach().clone()
-        all_X = [x for x in all_X]
+
+        all_X = [x.detach().clone() for x in all_X]
         return [indexes, all_X, targets]
 
 
-class Wrapper(TempDALIGenericIterator):
+class Wrapper(BaseWrapper):
     def __init__(self, dataset_size: int, *args, **kwargs):
         """Wrapper to have dataset size.
 
@@ -670,8 +783,8 @@ class Wrapper(TempDALIGenericIterator):
         self.dataset_size = dataset_size
 
     def __next__(self):
-        batch = super().__next__()[0]
-        x, target = batch["x"], batch["label"]
+        batch = super().__next__()
+        x, target = batch[0]["x"], batch[0]["label"]
         target = target.squeeze(-1).long()
         # PyTorch Lightning does double buffering
         # https://github.com/PyTorchLightning/pytorch-lightning/issues/1316,
@@ -696,6 +809,7 @@ class PretrainDALIDataModule(pl.LightningDataModule):
         data_fraction: float = -1.0,
         dali_device: str = "gpu",
         encode_indexes_into_labels: bool = False,
+        use_tfrecords: bool = False
     ):
         """DataModule for pretrain data using Nvidia DALI.
 
@@ -743,6 +857,8 @@ class PretrainDALIDataModule(pl.LightningDataModule):
         # hack to encode image indexes into the labels
         self.encode_indexes_into_labels = encode_indexes_into_labels
 
+        self.use_tfrecords = use_tfrecords
+
     @staticmethod
     def add_and_assert_specific_cfg(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:
         """Adds method specific default values/checks for config.
@@ -773,6 +889,7 @@ class PretrainDALIDataModule(pl.LightningDataModule):
         else:
             self.device = torch.device("cpu")
 
+    def train_dataloader(self):
         train_pipeline_builder = PretrainPipelineBuilder(
             self.train_data_path,
             batch_size=self.batch_size,
@@ -785,6 +902,7 @@ class PretrainDALIDataModule(pl.LightningDataModule):
             no_labels=self.no_labels,
             encode_indexes_into_labels=self.encode_indexes_into_labels,
             data_fraction=self.data_fraction,
+            use_tfrecords = self.use_tfrecords
         )
         train_pipeline = train_pipeline_builder.pipeline(
             batch_size=train_pipeline_builder.batch_size,
@@ -804,7 +922,7 @@ class PretrainDALIDataModule(pl.LightningDataModule):
         conversion_map = (
             train_pipeline_builder.conversion_map if self.encode_indexes_into_labels else None
         )
-        self.train_loader = PretrainWrapper(
+        train_loader = PretrainWrapper(
             model_batch_size=self.batch_size,
             model_rank=self.device_id,
             model_device=self.device,
@@ -817,8 +935,7 @@ class PretrainDALIDataModule(pl.LightningDataModule):
             auto_reset=True,
         )
 
-    def train_dataloader(self):
-        return self.train_loader
+        return train_loader
 
 
 class ClassificationDALIDataModule(pl.LightningDataModule):
@@ -831,6 +948,7 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         data_fraction: float = -1.0,
         dali_device: str = "gpu",
+        use_tfrecords: bool = False
     ):
         """DataModule for classification data using Nvidia DALI.
 
@@ -863,8 +981,10 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
         self.dali_device = dali_device
         assert dali_device in ["gpu", "cpu"]
 
+        self.use_tfrecords = use_tfrecords
+
         # handle custom data by creating the needed pipeline
-        if dataset in ["imagenet100", "imagenet"]:
+        if dataset in ["imagenet100", "imagenet75", "imagenet50", "imagenet25", "imagenet"]:
             self.pipeline_class = NormalPipelineBuilder
         elif dataset == "custom":
             self.pipeline_class = CustomNormalPipelineBuilder
@@ -888,6 +1008,8 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         # extra info about training
+        if not self.trainer:
+            self.trainer = pl.Trainer()
         self.device_id = self.trainer.local_rank
         self.shard_id = self.trainer.global_rank
         self.num_shards = self.trainer.world_size
@@ -898,6 +1020,7 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
         else:
             self.device = torch.device("cpu")
 
+    def train_dataloader(self):
         train_pipeline_builder = self.pipeline_class(
             self.train_data_path,
             validation=False,
@@ -908,6 +1031,7 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
             num_shards=self.num_shards,
             num_threads=self.num_workers,
             data_fraction=self.data_fraction,
+            use_tfrecords = self.use_tfrecords
         )
         train_pipeline = train_pipeline_builder.pipeline(
             batch_size=train_pipeline_builder.batch_size,
@@ -917,7 +1041,7 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
         )
         train_pipeline.build()
 
-        self.train_loader = Wrapper(
+        train_loader = Wrapper(
             pipelines=train_pipeline,
             dataset_size=train_pipeline.epoch_size("Reader"),
             output_map=["x", "label"],
@@ -926,6 +1050,9 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
             auto_reset=True,
         )
 
+        return train_loader
+
+    def val_dataloader(self) -> DALIGenericIterator:
         val_pipeline_builder = self.pipeline_class(
             self.val_data_path,
             validation=True,
@@ -944,7 +1071,7 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
         )
         val_pipeline.build()
 
-        self.val_loader = Wrapper(
+        val_loader = Wrapper(
             pipelines=val_pipeline,
             dataset_size=val_pipeline.epoch_size("Reader"),
             output_map=["x", "label"],
@@ -952,9 +1079,4 @@ class ClassificationDALIDataModule(pl.LightningDataModule):
             last_batch_policy=LastBatchPolicy.PARTIAL,
             auto_reset=True,
         )
-
-    def train_dataloader(self) -> TempDALIGenericIterator:
-        return self.train_loader
-
-    def val_dataloader(self) -> TempDALIGenericIterator:
-        return self.val_loader
+        return val_loader

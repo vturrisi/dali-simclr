@@ -67,10 +67,11 @@ class MaskedAutoencoderViT(VisionTransformer):
         # MAE encoder specifics
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.class_token = self.cls_token is not None
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if self.class_token else None
+        num_tokens = num_patches + 1 if self.class_token else num_patches
         self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False
+            torch.zeros(1, num_tokens, embed_dim), requires_grad=False
         )  # fixed sin-cos embedding
 
         self.blocks = nn.Sequential(
@@ -88,7 +89,7 @@ class MaskedAutoencoderViT(VisionTransformer):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = generate_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.patch_embed.num_patches**0.5), cls_token=True
+            self.pos_embed.shape[-1], int(self.patch_embed.num_patches**0.5), cls_token=self.class_token
         )
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
@@ -97,7 +98,8 @@ class MaskedAutoencoderViT(VisionTransformer):
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
         # timm's trunc_normal_(std=.02) is effectively normal_(std=0.02) as cutoff is too big (2.)
-        torch.nn.init.normal_(self.cls_token, std=0.02)
+        if self.class_token:
+            torch.nn.init.normal_(self.cls_token, std=0.02)
 
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
@@ -144,15 +146,19 @@ class MaskedAutoencoderViT(VisionTransformer):
         x = self.patch_embed(x)
 
         # add pos embed w/o cls token
-        x = x + self.pos_embed[:, 1:, :]
+        if self.class_token:
+            x = x + self.pos_embed[:, 1:, :]
+        else:
+            x = x + self.pos_embed
 
         # masking: length -> length * mask_ratio
         x, mask, ids_restore = self.random_masking(x, mask_ratio)
 
         # append cls token
-        cls_token = self.cls_token + self.pos_embed[:, :1, :]
-        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        if self.class_token:
+            cls_token = self.cls_token + self.pos_embed[:, :1, :]
+            cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
 
         # apply Transformer blocks
         x = self.blocks(x)
